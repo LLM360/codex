@@ -44,6 +44,58 @@ DEFAULT_ISSUER = "https://auth.openai.com"
 
 EXIT_CODE_WHEN_ADDRESS_ALREADY_IN_USE = 13
 
+CA_CONTEXT = None
+CODEX_LOGIN_TRACE = os.environ.get("CODEX_LOGIN_TRACE", "false") in ["true", "1"]
+
+try:
+
+    def trace(msg: str) -> None:
+        if CODEX_LOGIN_TRACE:
+            print(msg)
+
+    def attempt_request(method: str) -> bool:
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{DEFAULT_ISSUER}/.well-known/openid-configuration",
+                    method="GET",
+                ),
+                context=CA_CONTEXT,
+            ) as resp:
+                if resp.status != 200:
+                    trace(f"Request using {method} failed: {resp.status}")
+                    return False
+
+                trace(f"Request using {method} succeeded")
+                return True
+        except Exception as e:
+            trace(f"Request using {method} failed: {e}")
+            return False
+
+    status = attempt_request("default settings")
+    if not status:
+        try:
+            import truststore
+
+            truststore.inject_into_ssl()
+            status = attempt_request("truststore")
+        except Exception as e:
+            trace(f"Failed to use truststore: {e}")
+
+    if not status:
+        try:
+            import ssl
+            import certifi as _certifi
+
+            CA_CONTEXT = ssl.create_default_context(cafile=_certifi.where())
+            status = attempt_request("certify")
+        except Exception as e:
+            trace(f"Failed to use certify: {e}")
+
+
+except Exception:
+    pass
+
 
 @dataclass
 class TokenData:
@@ -110,7 +162,7 @@ def main() -> None:
                 eprint(f"Failed to open browser: {e}")
 
         eprint(
-            f"If your browser did not open, navigate to this URL to authenticate:\n\n{auth_url}"
+            f". If your browser did not open, navigate to this URL to authenticate: \n\n{auth_url}"
         )
 
         # Run the server in the main thread until `shutdown()` is called by the
@@ -255,7 +307,8 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
                 data=exchange_data,
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+            ),
+            context=CA_CONTEXT,
         ) as resp:
             exchange_payload = json.loads(resp.read().decode())
             exchanged_access_token = exchange_payload["access_token"]
@@ -326,7 +379,8 @@ class _ApiKeyHTTPHandler(http.server.BaseHTTPRequestHandler):
                 data=data,
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+            ),
+            context=CA_CONTEXT,
         ) as resp:
             payload = json.loads(resp.read().decode())
 
@@ -506,7 +560,7 @@ def maybe_redeem_credits(
                 headers={"Content-Type": "application/json"},
             )
 
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, context=CA_CONTEXT) as resp:
                 refresh_data = json.loads(resp.read().decode())
                 new_id_token = refresh_data.get("id_token")
                 new_id_claims = parse_id_token_claims(new_id_token or "")
@@ -596,7 +650,7 @@ def maybe_redeem_credits(
             headers={"Content-Type": "application/json"},
         )
 
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=CA_CONTEXT) as resp:
             redeem_data = json.loads(resp.read().decode())
 
         granted = redeem_data.get("granted_chatgpt_subscriber_api_credits", 0)

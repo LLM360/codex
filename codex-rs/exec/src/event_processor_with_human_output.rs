@@ -21,7 +21,6 @@ use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::TaskCompleteEvent;
-use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TurnDiffEvent;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
@@ -33,8 +32,8 @@ use std::time::Instant;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::event_processor::create_config_summary_entries;
 use crate::event_processor::handle_last_message;
+use codex_common::create_config_summary_entries;
 
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
@@ -183,8 +182,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 return CodexStatus::InitiateShutdown;
             }
-            EventMsg::TokenCount(TokenUsage { total_tokens, .. }) => {
-                ts_println!(self, "tokens used: {total_tokens}");
+            EventMsg::TokenCount(token_usage) => {
+                ts_println!(self, "tokens used: {}", token_usage.blended_total());
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 if !self.answer_started {
@@ -208,6 +207,14 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     self.reasoning_started = true;
                 }
                 print!("{delta}");
+                #[allow(clippy::expect_used)]
+                std::io::stdout().flush().expect("could not flush stdout");
+            }
+            EventMsg::AgentReasoningSectionBreak(_) => {
+                if !self.show_agent_reasoning {
+                    return CodexStatus::Running;
+                }
+                println!();
                 #[allow(clippy::expect_used)]
                 std::io::stdout().flush().expect("could not flush stdout");
             }
@@ -256,6 +263,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 call_id,
                 command,
                 cwd,
+                parsed_cmd: _,
             }) => {
                 self.call_id_to_command.insert(
                     call_id.clone(),

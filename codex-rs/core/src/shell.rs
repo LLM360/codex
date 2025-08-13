@@ -167,9 +167,6 @@ mod tests {
         for (input, expected_cmd, expected_output) in cases {
             use std::collections::HashMap;
             use std::path::PathBuf;
-            use std::sync::Arc;
-
-            use tokio::sync::Notify;
 
             use crate::exec::ExecParams;
             use crate::exec::SandboxType;
@@ -215,9 +212,10 @@ mod tests {
                         "HOME".to_string(),
                         temp_home.path().to_str().unwrap().to_string(),
                     )]),
+                    with_escalated_permissions: None,
+                    justification: None,
                 },
                 SandboxType::None,
-                Arc::new(Notify::new()),
                 &SandboxPolicy::DangerFullAccess,
                 &None,
                 None,
@@ -228,7 +226,7 @@ mod tests {
             assert_eq!(output.exit_code, 0, "input: {input:?} output: {output:?}");
             if let Some(expected) = expected_output {
                 assert_eq!(
-                    output.stdout, expected,
+                    output.stdout.text, expected,
                     "input: {input:?} output: {output:?}"
                 );
             }

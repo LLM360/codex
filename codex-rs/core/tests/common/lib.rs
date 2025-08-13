@@ -2,6 +2,7 @@
 
 use tempfile::TempDir;
 
+use codex_core::CodexConversation;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
@@ -72,8 +73,20 @@ pub fn load_sse_fixture_with_id(path: impl AsRef<std::path::Path>, id: &str) -> 
 }
 
 pub async fn wait_for_event<F>(
-    codex: &codex_core::Codex,
+    codex: &CodexConversation,
+    predicate: F,
+) -> codex_core::protocol::EventMsg
+where
+    F: FnMut(&codex_core::protocol::EventMsg) -> bool,
+{
+    use tokio::time::Duration;
+    wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
+}
+
+pub async fn wait_for_event_with_timeout<F>(
+    codex: &CodexConversation,
     mut predicate: F,
+    wait_time: tokio::time::Duration,
 ) -> codex_core::protocol::EventMsg
 where
     F: FnMut(&codex_core::protocol::EventMsg) -> bool,
@@ -81,7 +94,8 @@ where
     use tokio::time::Duration;
     use tokio::time::timeout;
     loop {
-        let ev = timeout(Duration::from_secs(1), codex.next_event())
+        // Allow a bit more time to accommodate async startup work (e.g. config IO, tool discovery)
+        let ev = timeout(wait_time.max(Duration::from_secs(5)), codex.next_event())
             .await
             .expect("timeout waiting for event")
             .expect("stream ended unexpectedly");

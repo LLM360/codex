@@ -20,7 +20,6 @@ use futures::prelude::*;
 use mcp_types::CallToolResult;
 use serde::Serialize;
 use serde_json;
-use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tracing::debug;
@@ -37,6 +36,7 @@ use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::apply_patch::get_writable_roots;
 use crate::apply_patch::{self};
 use crate::client::ModelClient;
+use crate::client_common::EnvironmentContext;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::config::Config;
@@ -45,10 +45,12 @@ use crate::conversation_history::ConversationHistory;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::error::SandboxErr;
+use crate::error::get_error_message_ui;
 use crate::exec::ExecParams;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::StdoutStream;
+use crate::exec::StreamOutput;
 use crate::exec::process_exec_tool_call;
 use crate::exec_env::create_env;
 use crate::mcp_connection_manager::McpConnectionManager;
@@ -61,6 +63,9 @@ use crate::models::ReasoningItemReasoningSummary;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::ShellToolCallParams;
+use crate::openai_tools::ToolsConfig;
+use crate::openai_tools::get_openai_tools;
+use crate::parse_command::parse_command;
 use crate::plan_tool::handle_update_plan;
 use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageDeltaEvent;
@@ -69,6 +74,7 @@ use crate::protocol::AgentReasoningDeltaEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentDeltaEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
+use crate::protocol::AgentReasoningSectionBreakEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
@@ -117,11 +123,7 @@ pub struct CodexSpawnOk {
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
-    pub async fn spawn(
-        config: Config,
-        auth: Option<CodexAuth>,
-        ctrl_c: Arc<Notify>,
-    ) -> CodexResult<CodexSpawnOk> {
+    pub async fn spawn(config: Config, auth: Option<CodexAuth>) -> CodexResult<CodexSpawnOk> {
         // experimental resume path (undocumented)
         let resume_path = config.experimental_resume.clone();
         info!("resume_path: {resume_path:?}");
@@ -149,9 +151,9 @@ impl Codex {
 
         // Generate a unique ID for the lifetime of this Codex session.
         let session_id = Uuid::new_v4();
-        tokio::spawn(submission_loop(
-            session_id, config, auth, rx_sub, tx_event, ctrl_c,
-        ));
+
+        // This task will run until Op::Shutdown is received.
+        tokio::spawn(submission_loop(session_id, config, auth, rx_sub, tx_event));
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
@@ -203,7 +205,6 @@ impl Codex {
 pub(crate) struct Session {
     client: ModelClient,
     pub(crate) tx_event: Sender<Event>,
-    ctrl_c: Arc<Notify>,
 
     /// The session's current working directory. All relative paths provided by
     /// the model as well as sandbox policies are resolved against this path
@@ -216,6 +217,7 @@ pub(crate) struct Session {
     shell_environment_policy: ShellEnvironmentPolicy,
     pub(crate) writable_roots: Mutex<Vec<PathBuf>>,
     disable_response_storage: bool,
+    tools_config: ToolsConfig,
 
     /// Manager for external MCP servers/tools.
     mcp_connection_manager: McpConnectionManager,
@@ -397,6 +399,7 @@ impl Session {
                 call_id,
                 command: command_for_display.clone(),
                 cwd,
+                parsed_cmd: parse_command(&command_for_display),
             }),
         };
         let event = Event {
@@ -424,8 +427,8 @@ impl Session {
         // Because stdout and stderr could each be up to 100 KiB, we send
         // truncated versions.
         const MAX_STREAM_OUTPUT: usize = 5 * 1024; // 5KiB
-        let stdout = stdout.chars().take(MAX_STREAM_OUTPUT).collect();
-        let stderr = stderr.chars().take(MAX_STREAM_OUTPUT).collect();
+        let stdout = stdout.text.chars().take(MAX_STREAM_OUTPUT).collect();
+        let stderr = stderr.text.chars().take(MAX_STREAM_OUTPUT).collect();
 
         let msg = if is_apply_patch {
             EventMsg::PatchApplyEnd(PatchApplyEndEvent {
@@ -463,6 +466,56 @@ impl Session {
                 let _ = self.tx_event.send(event).await;
             }
         }
+    }
+    /// Runs the exec tool call and emits events for the begin and end of the
+    /// command even on error.
+    ///
+    /// Returns the output of the exec tool call.
+    async fn run_exec_with_events<'a>(
+        &self,
+        turn_diff_tracker: &mut TurnDiffTracker,
+        begin_ctx: ExecCommandContext,
+        exec_args: ExecInvokeArgs<'a>,
+    ) -> crate::error::Result<ExecToolCallOutput> {
+        let is_apply_patch = begin_ctx.apply_patch.is_some();
+        let sub_id = begin_ctx.sub_id.clone();
+        let call_id = begin_ctx.call_id.clone();
+
+        self.on_exec_command_begin(turn_diff_tracker, begin_ctx.clone())
+            .await;
+
+        let result = process_exec_tool_call(
+            exec_args.params,
+            exec_args.sandbox_type,
+            exec_args.sandbox_policy,
+            exec_args.codex_linux_sandbox_exe,
+            exec_args.stdout_stream,
+        )
+        .await;
+
+        let output_stderr;
+        let borrowed: &ExecToolCallOutput = match &result {
+            Ok(output) => output,
+            Err(e) => {
+                output_stderr = ExecToolCallOutput {
+                    exit_code: -1,
+                    stdout: StreamOutput::new(String::new()),
+                    stderr: StreamOutput::new(get_error_message_ui(e)),
+                    duration: Duration::default(),
+                };
+                &output_stderr
+            }
+        };
+        self.on_exec_command_end(
+            turn_diff_tracker,
+            &sub_id,
+            &call_id,
+            borrowed,
+            is_apply_patch,
+        )
+        .await;
+
+        result
     }
 
     /// Helper that emits a BackgroundEvent with the given message. This keeps
@@ -518,7 +571,7 @@ impl Session {
             .await
     }
 
-    pub fn abort(&self) {
+    fn abort(&self) {
         info!("Aborting existing session");
         let mut state = self.state.lock().unwrap();
         state.pending_approvals.clear();
@@ -632,7 +685,7 @@ impl AgentTask {
             let event = Event {
                 id: self.sub_id,
                 msg: EventMsg::Error(ErrorEvent {
-                    message: "Turn interrupted".to_string(),
+                    message: " Turn interrupted".to_string(),
                 }),
             };
             let tx_event = self.sess.tx_event.clone();
@@ -649,7 +702,6 @@ async fn submission_loop(
     auth: Option<CodexAuth>,
     rx_sub: Receiver<Submission>,
     tx_event: Sender<Event>,
-    ctrl_c: Arc<Notify>,
 ) {
     let mut sess: Option<Arc<Session>> = None;
     // shorthand - send an event when there is no active session
@@ -664,21 +716,8 @@ async fn submission_loop(
         tx_event.send(event).await.ok();
     };
 
-    loop {
-        let interrupted = ctrl_c.notified();
-        let sub = tokio::select! {
-            res = rx_sub.recv() => match res {
-                Ok(sub) => sub,
-                Err(_) => break,
-            },
-            _ = interrupted => {
-                if let Some(sess) = sess.as_ref(){
-                    sess.abort();
-                }
-                continue;
-            },
-        };
-
+    // To break out of this loop, send Op::Shutdown.
+    while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
         match sub.op {
             Op::Interrupt => {
@@ -810,8 +849,13 @@ async fn submission_loop(
                 let default_shell = shell::default_user_shell().await;
                 sess = Some(Arc::new(Session {
                     client,
+                    tools_config: ToolsConfig::new(
+                        &config.model_family,
+                        approval_policy,
+                        sandbox_policy.clone(),
+                        config.include_plan_tool,
+                    ),
                     tx_event: tx_event.clone(),
-                    ctrl_c: Arc::clone(&ctrl_c),
                     user_instructions,
                     base_instructions,
                     approval_policy,
@@ -956,7 +1000,7 @@ async fn submission_loop(
                 };
 
                 // Create a summarization request as user input
-                const SUMMARIZATION_PROMPT: &str = include_str!("../../../SUMMARY.md");
+                const SUMMARIZATION_PROMPT: &str = include_str!("prompt_for_compact_command.md");
 
                 // Attempt to inject input into current task
                 if let Err(items) = sess.inject_input(vec![InputItem::Text {
@@ -1036,7 +1080,7 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
     sess.record_conversation_items(&[initial_input_for_turn.clone().into()])
         .await;
 
-    let last_agent_message: Option<String>;
+    let mut last_agent_message: Option<String> = None;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let mut turn_diff_tracker = TurnDiffTracker::new();
@@ -1186,7 +1230,8 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
                     }),
                 };
                 sess.tx_event.send(event).await.ok();
-                return;
+                // let the user continue the conversation
+                break;
             }
         }
     }
@@ -1204,13 +1249,22 @@ async fn run_turn(
     sub_id: String,
     input: Vec<ResponseItem>,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
-    let extra_tools = sess.mcp_connection_manager.list_all_tools();
+    let tools = get_openai_tools(
+        &sess.tools_config,
+        Some(sess.mcp_connection_manager.list_all_tools()),
+    );
+
     let prompt = Prompt {
         input,
         user_instructions: sess.user_instructions.clone(),
         store: !sess.disable_response_storage,
-        extra_tools,
+        tools,
         base_instructions_override: sess.base_instructions.clone(),
+        environment_context: Some(EnvironmentContext {
+            cwd: sess.cwd.clone(),
+            approval_policy: sess.approval_policy,
+            sandbox_policy: sess.sandbox_policy.clone(),
+        }),
     };
 
     let mut retries = 0;
@@ -1219,6 +1273,9 @@ async fn run_turn(
             Ok(output) => return Ok(output),
             Err(CodexErr::Interrupted) => return Err(CodexErr::Interrupted),
             Err(CodexErr::EnvVar(var)) => return Err(CodexErr::EnvVar(var)),
+            Err(e @ (CodexErr::UsageLimitReached(_) | CodexErr::UsageNotIncluded)) => {
+                return Err(e);
+            }
             Err(e) => {
                 // Use the configured provider-specific stream retry budget.
                 let max_retries = sess.client.get_provider().stream_max_retries();
@@ -1399,6 +1456,13 @@ async fn try_run_turn(
                 };
                 sess.tx_event.send(event).await.ok();
             }
+            ResponseEvent::ReasoningSummaryPartAdded => {
+                let event = Event {
+                    id: sub_id.to_string(),
+                    msg: EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {}),
+                };
+                sess.tx_event.send(event).await.ok();
+            }
             ResponseEvent::ReasoningContentDelta(delta) => {
                 if sess.show_raw_agent_reasoning {
                     let event = Event {
@@ -1436,7 +1500,8 @@ async fn run_compact_task(
         input: turn_input,
         user_instructions: None,
         store: !sess.disable_response_storage,
-        extra_tools: HashMap::new(),
+        environment_context: None,
+        tools: Vec::new(),
         base_instructions_override: Some(compact_instructions.clone()),
     };
 
@@ -1580,6 +1645,8 @@ async fn handle_response_item(
                 command: action.command,
                 workdir: action.working_directory,
                 timeout_ms: action.timeout_ms,
+                with_escalated_permissions: None,
+                justification: None,
             };
             let effective_call_id = match (call_id, id) {
                 (Some(call_id), _) => call_id,
@@ -1668,6 +1735,8 @@ fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
         cwd: sess.resolve_path(params.workdir.clone()),
         timeout_ms: params.timeout_ms,
         env: create_env(&sess.shell_environment_policy),
+        with_escalated_permissions: params.with_escalated_permissions,
+        justification: params.justification,
     }
 }
 
@@ -1691,6 +1760,14 @@ fn parse_container_exec_arguments(
             Err(Box::new(output))
         }
     }
+}
+
+pub struct ExecInvokeArgs<'a> {
+    pub params: ExecParams,
+    pub sandbox_type: SandboxType,
+    pub sandbox_policy: &'a SandboxPolicy,
+    pub codex_linux_sandbox_exe: &'a Option<PathBuf>,
+    pub stdout_stream: Option<StdoutStream>,
 }
 
 fn maybe_run_with_user_profile(params: ExecParams, sess: &Session) -> ExecParams {
@@ -1768,13 +1845,19 @@ async fn handle_container_exec_with_params(
                 cwd: cwd.clone(),
                 timeout_ms: params.timeout_ms,
                 env: HashMap::new(),
+                with_escalated_permissions: params.with_escalated_permissions,
+                justification: params.justification.clone(),
             };
             let safety = if *user_explicitly_approved_this_action {
                 SafetyCheck::AutoApprove {
                     sandbox_type: SandboxType::None,
                 }
             } else {
-                assess_safety_for_untrusted_command(sess.approval_policy, &sess.sandbox_policy)
+                assess_safety_for_untrusted_command(
+                    sess.approval_policy,
+                    &sess.sandbox_policy,
+                    params.with_escalated_permissions.unwrap_or(false),
+                )
             };
             (
                 params,
@@ -1790,6 +1873,7 @@ async fn handle_container_exec_with_params(
                     sess.approval_policy,
                     &sess.sandbox_policy,
                     &state.approved_commands,
+                    params.with_escalated_permissions.unwrap_or(false),
                 )
             };
             let command_for_display = params.command.clone();
@@ -1806,7 +1890,7 @@ async fn handle_container_exec_with_params(
                     call_id.clone(),
                     params.command.clone(),
                     params.cwd.clone(),
-                    None,
+                    params.justification.clone(),
                 )
                 .await;
             match rx_approve.await.unwrap_or_default() {
@@ -1856,51 +1940,34 @@ async fn handle_container_exec_with_params(
             },
         ),
     };
-    sess.on_exec_command_begin(turn_diff_tracker, exec_command_context.clone())
-        .await;
 
     let params = maybe_run_with_user_profile(params, sess);
-    let output_result = process_exec_tool_call(
-        params.clone(),
-        sandbox_type,
-        sess.ctrl_c.clone(),
-        &sess.sandbox_policy,
-        &sess.codex_linux_sandbox_exe,
-        Some(StdoutStream {
-            sub_id: sub_id.clone(),
-            call_id: call_id.clone(),
-            tx_event: sess.tx_event.clone(),
-        }),
-    )
-    .await;
+    let output_result = sess
+        .run_exec_with_events(
+            turn_diff_tracker,
+            exec_command_context.clone(),
+            ExecInvokeArgs {
+                params: params.clone(),
+                sandbox_type,
+                sandbox_policy: &sess.sandbox_policy,
+                codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
+                stdout_stream: Some(StdoutStream {
+                    sub_id: sub_id.clone(),
+                    call_id: call_id.clone(),
+                    tx_event: sess.tx_event.clone(),
+                }),
+            },
+        )
+        .await;
 
     match output_result {
         Ok(output) => {
-            let ExecToolCallOutput {
-                exit_code,
-                stdout,
-                stderr,
-                duration,
-            } = &output;
-
-            sess.on_exec_command_end(
-                turn_diff_tracker,
-                &sub_id,
-                &call_id,
-                &output,
-                exec_command_context.apply_patch.is_some(),
-            )
-            .await;
+            let ExecToolCallOutput { exit_code, .. } = &output;
 
             let is_success = *exit_code == 0;
-            let content = format_exec_output(
-                if is_success { stdout } else { stderr },
-                *exit_code,
-                *duration,
-            );
-
+            let content = format_exec_output(output);
             ResponseInputItem::FunctionCallOutput {
-                call_id,
+                call_id: call_id.clone(),
                 output: FunctionCallOutputPayload {
                     content,
                     success: Some(is_success),
@@ -1918,16 +1985,13 @@ async fn handle_container_exec_with_params(
             )
             .await
         }
-        Err(e) => {
-            // Handle non-sandbox errors
-            ResponseInputItem::FunctionCallOutput {
-                call_id,
-                output: FunctionCallOutputPayload {
-                    content: format!("execution error: {e}"),
-                    success: None,
-                },
-            }
-        }
+        Err(e) => ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.clone(),
+            output: FunctionCallOutputPayload {
+                content: format!("execution error: {e}"),
+                success: None,
+            },
+        },
     }
 }
 
@@ -1942,15 +2006,32 @@ async fn handle_sandbox_error(
     let call_id = exec_command_context.call_id.clone();
     let sub_id = exec_command_context.sub_id.clone();
     let cwd = exec_command_context.cwd.clone();
-    let is_apply_patch = exec_command_context.apply_patch.is_some();
 
-    // Early out if the user never wants to be asked for approval; just return to the model immediately
-    if sess.approval_policy == AskForApproval::Never {
+    // Early out if either the user never wants to be asked for approval, or
+    // we're letting the model manage escalation requests. Otherwise, continue
+    match sess.approval_policy {
+        AskForApproval::Never | AskForApproval::OnRequest => {
+            return ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: format!(
+                        "failed in sandbox {sandbox_type:?} with execution error: {error}"
+                    ),
+                    success: Some(false),
+                },
+            };
+        }
+        AskForApproval::UnlessTrusted | AskForApproval::OnFailure => (),
+    }
+
+    // similarly, if the command timed out, we can simply return this failure to the model
+    if matches!(error, SandboxErr::Timeout) {
         return ResponseInputItem::FunctionCallOutput {
             call_id,
             output: FunctionCallOutputPayload {
                 content: format!(
-                    "failed in sandbox {sandbox_type:?} with execution error: {error}"
+                    "command timed out after {} milliseconds",
+                    params.timeout_duration().as_millis()
                 ),
                 success: Some(false),
             },
@@ -1990,68 +2071,48 @@ async fn handle_sandbox_error(
             sess.notify_background_event(&sub_id, "retrying command without sandbox")
                 .await;
 
-            sess.on_exec_command_begin(turn_diff_tracker, exec_command_context)
-                .await;
-
             // This is an escalated retry; the policy will not be
             // examined and the sandbox has been set to `None`.
-            let retry_output_result = process_exec_tool_call(
-                params,
-                SandboxType::None,
-                sess.ctrl_c.clone(),
-                &sess.sandbox_policy,
-                &sess.codex_linux_sandbox_exe,
-                Some(StdoutStream {
-                    sub_id: sub_id.clone(),
-                    call_id: call_id.clone(),
-                    tx_event: sess.tx_event.clone(),
-                }),
-            )
-            .await;
+            let retry_output_result = sess
+                .run_exec_with_events(
+                    turn_diff_tracker,
+                    exec_command_context.clone(),
+                    ExecInvokeArgs {
+                        params,
+                        sandbox_type: SandboxType::None,
+                        sandbox_policy: &sess.sandbox_policy,
+                        codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
+                        stdout_stream: Some(StdoutStream {
+                            sub_id: sub_id.clone(),
+                            call_id: call_id.clone(),
+                            tx_event: sess.tx_event.clone(),
+                        }),
+                    },
+                )
+                .await;
 
             match retry_output_result {
                 Ok(retry_output) => {
-                    let ExecToolCallOutput {
-                        exit_code,
-                        stdout,
-                        stderr,
-                        duration,
-                    } = &retry_output;
-
-                    sess.on_exec_command_end(
-                        turn_diff_tracker,
-                        &sub_id,
-                        &call_id,
-                        &retry_output,
-                        is_apply_patch,
-                    )
-                    .await;
+                    let ExecToolCallOutput { exit_code, .. } = &retry_output;
 
                     let is_success = *exit_code == 0;
-                    let content = format_exec_output(
-                        if is_success { stdout } else { stderr },
-                        *exit_code,
-                        *duration,
-                    );
+                    let content = format_exec_output(retry_output);
 
                     ResponseInputItem::FunctionCallOutput {
-                        call_id,
+                        call_id: call_id.clone(),
                         output: FunctionCallOutputPayload {
                             content,
                             success: Some(is_success),
                         },
                     }
                 }
-                Err(e) => {
-                    // Handle retry failure
-                    ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: FunctionCallOutputPayload {
-                            content: format!("retry failed: {e}"),
-                            success: None,
-                        },
-                    }
-                }
+                Err(e) => ResponseInputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutputPayload {
+                        content: format!("retry failed: {e}"),
+                        success: None,
+                    },
+                },
             }
         }
         ReviewDecision::Denied | ReviewDecision::Abort => {
@@ -2068,7 +2129,14 @@ async fn handle_sandbox_error(
 }
 
 /// Exec output is a pre-serialized JSON payload
-fn format_exec_output(output: &str, exit_code: i32, duration: Duration) -> String {
+fn format_exec_output(exec_output: ExecToolCallOutput) -> String {
+    let ExecToolCallOutput {
+        exit_code,
+        stdout,
+        stderr,
+        duration,
+    } = exec_output;
+
     #[derive(Serialize)]
     struct ExecMetadata {
         exit_code: i32,
@@ -2084,8 +2152,18 @@ fn format_exec_output(output: &str, exit_code: i32, duration: Duration) -> Strin
     // round to 1 decimal place
     let duration_seconds = ((duration.as_secs_f32()) * 10.0).round() / 10.0;
 
+    let is_success = exit_code == 0;
+    let output = if is_success { stdout } else { stderr };
+
+    let mut formatted_output = output.text;
+    if let Some(truncated_after_lines) = output.truncated_after_lines {
+        formatted_output.push_str(&format!(
+            "\n\n[Output truncated after {truncated_after_lines} lines: too many lines or bytes.]",
+        ));
+    }
+
     let payload = ExecOutput {
-        output,
+        output: &formatted_output,
         metadata: ExecMetadata {
             exit_code,
             duration_seconds,
