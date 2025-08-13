@@ -85,6 +85,7 @@ impl RolloutRecorder {
     ) -> std::io::Result<Self> {
         let LogFileInfo {
             file,
+            cwd_file,
             session_id,
             timestamp,
         } = create_log_file(config, uuid)?;
@@ -109,6 +110,7 @@ impl RolloutRecorder {
         // driver instead of blocking the runtime.
         tokio::task::spawn(rollout_writer(
             tokio::fs::File::from_std(file),
+            tokio::fs::File::from_std(cwd_file),
             rx,
             Some(SessionMeta {
                 timestamp,
@@ -215,9 +217,20 @@ impl RolloutRecorder {
             .read(true)
             .open(path)?;
 
+        // Create a corresponding file in the current working directory for resumed sessions
+        let filename = path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("resumed-session.jsonl");
+        let cwd_path = cwd.join(filename);
+        let cwd_file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&cwd_path)?;
+
         let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
         tokio::task::spawn(rollout_writer(
             tokio::fs::File::from_std(file),
+            tokio::fs::File::from_std(cwd_file),
             rx,
             None,
             cwd,
@@ -245,6 +258,9 @@ impl RolloutRecorder {
 struct LogFileInfo {
     /// Opened file handle to the rollout file.
     file: File,
+
+    /// Opened file handle to the rollout file in current working directory.
+    cwd_file: File,
 
     /// Session ID (also embedded in filename).
     session_id: Uuid,
@@ -274,14 +290,23 @@ fn create_log_file(config: &Config, session_id: Uuid) -> std::io::Result<LogFile
 
     let filename = format!("rollout-{date_str}-{session_id}.jsonl");
 
-    let path = dir.join(filename);
+    // Create file in sessions directory
+    let path = dir.join(&filename);
     let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(&path)?;
 
+    // Create file in current working directory
+    let cwd_path = config.cwd.join(&filename);
+    let cwd_file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&cwd_path)?;
+
     Ok(LogFileInfo {
         file,
+        cwd_file,
         session_id,
         timestamp,
     })
@@ -289,11 +314,13 @@ fn create_log_file(config: &Config, session_id: Uuid) -> std::io::Result<LogFile
 
 async fn rollout_writer(
     file: tokio::fs::File,
+    cwd_file: tokio::fs::File,
     mut rx: mpsc::Receiver<RolloutCmd>,
     mut meta: Option<SessionMeta>,
     cwd: std::path::PathBuf,
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter { file };
+    let mut cwd_writer = JsonlWriter { file: cwd_file };
 
     // If we have a meta, collect git info asynchronously and write meta first
     if let Some(session_meta) = meta.take() {
@@ -303,8 +330,9 @@ async fn rollout_writer(
             git: git_info,
         };
 
-        // Write the SessionMeta as the first item in the file
+        // Write the SessionMeta as the first item in both files
         writer.write_line(&session_meta_with_git).await?;
+        cwd_writer.write_line(&session_meta_with_git).await?;
     }
 
     // Process rollout commands
@@ -319,6 +347,7 @@ async fn rollout_writer(
                         | ResponseItem::FunctionCallOutput { .. }
                         | ResponseItem::Reasoning { .. } => {
                             writer.write_line(&item).await?;
+                            cwd_writer.write_line(&item).await?;
                         }
                         ResponseItem::Other => {}
                     }
@@ -331,12 +360,12 @@ async fn rollout_writer(
                     #[serde(flatten)]
                     state: &'a SessionStateSnapshot,
                 }
-                writer
-                    .write_line(&StateLine {
-                        record_type: "state",
-                        state: &state,
-                    })
-                    .await?;
+                let state_line = StateLine {
+                    record_type: "state",
+                    state: &state,
+                };
+                writer.write_line(&state_line).await?;
+                cwd_writer.write_line(&state_line).await?;
             }
             RolloutCmd::Shutdown { ack } => {
                 let _ = ack.send(());
