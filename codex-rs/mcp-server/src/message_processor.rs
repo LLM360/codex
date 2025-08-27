@@ -1,27 +1,22 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
+use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
-use crate::mcp_protocol::ToolCallRequestParams;
-use crate::mcp_protocol::ToolCallResponse;
-use crate::mcp_protocol::ToolCallResponseResult;
 use crate::outgoing_message::OutgoingMessageSender;
-use crate::tool_handlers::create_conversation::handle_create_conversation;
-use crate::tool_handlers::send_message::handle_send_message;
+use codex_protocol::mcp_protocol::ClientRequest;
 
 use codex_core::ConversationManager;
-use codex_core::config::Config as CodexConfig;
+use codex_core::config::Config;
 use codex_core::protocol::Submission;
-use mcp_types::CallToolRequest;
+use codex_login::AuthManager;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
-use mcp_types::ClientRequest;
+use mcp_types::ClientRequest as McpClientRequest;
 use mcp_types::ContentBlock;
 use mcp_types::JSONRPCError;
 use mcp_types::JSONRPCErrorError;
@@ -35,17 +30,18 @@ use mcp_types::ServerCapabilitiesTools;
 use mcp_types::ServerNotification;
 use mcp_types::TextContent;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task;
 use uuid::Uuid;
 
 pub(crate) struct MessageProcessor {
+    codex_message_processor: CodexMessageProcessor,
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, Uuid>>>,
-    running_session_ids: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl MessageProcessor {
@@ -54,34 +50,45 @@ impl MessageProcessor {
     pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
+        config: Arc<Config>,
     ) -> Self {
+        let outgoing = Arc::new(outgoing);
+        let auth_manager =
+            AuthManager::shared(config.codex_home.clone(), config.preferred_auth_method);
+        let conversation_manager = Arc::new(ConversationManager::new(auth_manager.clone()));
+        let codex_message_processor = CodexMessageProcessor::new(
+            auth_manager,
+            conversation_manager.clone(),
+            outgoing.clone(),
+            codex_linux_sandbox_exe.clone(),
+            config,
+        );
         Self {
-            outgoing: Arc::new(outgoing),
+            codex_message_processor,
+            outgoing,
             initialized: false,
             codex_linux_sandbox_exe,
-            conversation_manager: Arc::new(ConversationManager::default()),
+            conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
-            running_session_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    pub(crate) fn get_conversation_manager(&self) -> &ConversationManager {
-        &self.conversation_manager
-    }
-
-    pub(crate) fn outgoing(&self) -> Arc<OutgoingMessageSender> {
-        self.outgoing.clone()
-    }
-
-    pub(crate) fn running_session_ids(&self) -> Arc<Mutex<HashSet<Uuid>>> {
-        self.running_session_ids.clone()
-    }
-
     pub(crate) async fn process_request(&mut self, request: JSONRPCRequest) {
+        if let Ok(request_json) = serde_json::to_value(request.clone())
+            && let Ok(codex_request) = serde_json::from_value::<ClientRequest>(request_json)
+        {
+            // If the request is a Codex request, handle it with the Codex
+            // message processor.
+            self.codex_message_processor
+                .process_request(codex_request)
+                .await;
+            return;
+        }
+
         // Hold on to the ID so we can respond.
         let request_id = request.id.clone();
 
-        let client_request = match ClientRequest::try_from(request) {
+        let client_request = match McpClientRequest::try_from(request) {
             Ok(client_request) => client_request,
             Err(e) => {
                 tracing::warn!("Failed to convert request: {e}");
@@ -91,43 +98,43 @@ impl MessageProcessor {
 
         // Dispatch to a dedicated handler for each request type.
         match client_request {
-            ClientRequest::InitializeRequest(params) => {
+            McpClientRequest::InitializeRequest(params) => {
                 self.handle_initialize(request_id, params).await;
             }
-            ClientRequest::PingRequest(params) => {
+            McpClientRequest::PingRequest(params) => {
                 self.handle_ping(request_id, params).await;
             }
-            ClientRequest::ListResourcesRequest(params) => {
+            McpClientRequest::ListResourcesRequest(params) => {
                 self.handle_list_resources(params);
             }
-            ClientRequest::ListResourceTemplatesRequest(params) => {
+            McpClientRequest::ListResourceTemplatesRequest(params) => {
                 self.handle_list_resource_templates(params);
             }
-            ClientRequest::ReadResourceRequest(params) => {
+            McpClientRequest::ReadResourceRequest(params) => {
                 self.handle_read_resource(params);
             }
-            ClientRequest::SubscribeRequest(params) => {
+            McpClientRequest::SubscribeRequest(params) => {
                 self.handle_subscribe(params);
             }
-            ClientRequest::UnsubscribeRequest(params) => {
+            McpClientRequest::UnsubscribeRequest(params) => {
                 self.handle_unsubscribe(params);
             }
-            ClientRequest::ListPromptsRequest(params) => {
+            McpClientRequest::ListPromptsRequest(params) => {
                 self.handle_list_prompts(params);
             }
-            ClientRequest::GetPromptRequest(params) => {
+            McpClientRequest::GetPromptRequest(params) => {
                 self.handle_get_prompt(params);
             }
-            ClientRequest::ListToolsRequest(params) => {
+            McpClientRequest::ListToolsRequest(params) => {
                 self.handle_list_tools(request_id, params).await;
             }
-            ClientRequest::CallToolRequest(params) => {
+            McpClientRequest::CallToolRequest(params) => {
                 self.handle_call_tool(request_id, params).await;
             }
-            ClientRequest::SetLevelRequest(params) => {
+            McpClientRequest::SetLevelRequest(params) => {
                 self.handle_set_level(params);
             }
-            ClientRequest::CompleteRequest(params) => {
+            McpClientRequest::CompleteRequest(params) => {
                 self.handle_complete(params);
             }
         }
@@ -319,14 +326,6 @@ impl MessageProcessor {
         params: <mcp_types::CallToolRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::info!("tools/call -> params: {:?}", params);
-        // Serialize params into JSON and try to parse as new type
-        if let Ok(new_params) =
-            serde_json::to_value(&params).and_then(serde_json::from_value::<ToolCallRequestParams>)
-        {
-            // New tool call matched → forward
-            self.handle_new_tool_calls(id, new_params).await;
-            return;
-        }
         let CallToolRequestParams { name, arguments } = params;
 
         match name.as_str() {
@@ -350,32 +349,8 @@ impl MessageProcessor {
             }
         }
     }
-    async fn handle_new_tool_calls(&self, request_id: RequestId, params: ToolCallRequestParams) {
-        match params {
-            ToolCallRequestParams::ConversationCreate(args) => {
-                handle_create_conversation(self, request_id, args).await;
-            }
-            ToolCallRequestParams::ConversationSendMessage(args) => {
-                handle_send_message(self, request_id, args).await;
-            }
-            _ => {
-                let result = CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent {
-                        r#type: "text".to_string(),
-                        text: "Unknown tool".to_string(),
-                        annotations: None,
-                    })],
-                    is_error: Some(true),
-                    structured_content: None,
-                };
-                self.send_response::<CallToolRequest>(request_id, result)
-                    .await;
-            }
-        }
-    }
-
     async fn handle_tool_call_codex(&self, id: RequestId, arguments: Option<serde_json::Value>) {
-        let (initial_prompt, config): (String, CodexConfig) = match arguments {
+        let (initial_prompt, config): (String, Config) = match arguments {
             Some(json_val) => match serde_json::from_value::<CodexToolCallParam>(json_val) {
                 Ok(tool_cfg) => match tool_cfg.into_config(self.codex_linux_sandbox_exe.clone()) {
                     Ok(cfg) => cfg,
@@ -669,21 +644,5 @@ impl MessageProcessor {
         params: <mcp_types::LoggingMessageNotification as mcp_types::ModelContextProtocolNotification>::Params,
     ) {
         tracing::info!("notifications/message -> params: {:?}", params);
-    }
-
-    pub(crate) async fn send_response_with_optional_error(
-        &self,
-        id: RequestId,
-        message: Option<ToolCallResponseResult>,
-        error: Option<bool>,
-    ) {
-        let response = ToolCallResponse {
-            request_id: id.clone(),
-            is_error: error,
-            result: message,
-        };
-        let result: CallToolResult = response.into();
-        self.send_response::<mcp_types::CallToolRequest>(id.clone(), result)
-            .await;
     }
 }
